@@ -127,6 +127,13 @@ int index_status(const Index *index) {
 
 // ─── TODO: Implement these ───────────────────────────────────────────────────
 
+// Comparison function for qsort to sort index entries by path
+static int compare_index_entries(const void *a, const void *b) {
+    const IndexEntry *entry_a = (const IndexEntry *)a;
+    const IndexEntry *entry_b = (const IndexEntry *)b;
+    return strcmp(entry_a->path, entry_b->path);
+}
+
 // Load the index from .pes/index.
 //
 // HINTS - Useful functions:
@@ -135,10 +142,37 @@ int index_status(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_load(Index *index) {
-    // TODO: Implement index loading
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    index->count = 0;
+    FILE *f = fopen(".pes/index", "r");
+    if (!f) {
+        // If .pes/index doesn't exist, it's not an error, just an empty index.
+        return 0;
+    }
+
+    while (index->count < MAX_INDEX_ENTRIES) {
+        IndexEntry *entry = &index->entries[index->count];
+        char hash_hex[HASH_HEX_SIZE];
+        int items = fscanf(f, "%o %64s %lu %u %511s\n",
+                           &entry->mode, hash_hex, &entry->mtime_sec,
+                           &entry->size, entry->path);
+        if (items == EOF) {
+            break;
+        }
+        if (items != 5) {
+            fprintf(stderr, "error: invalid index file format\n");
+            fclose(f);
+            return -1;
+        }
+        if (hex_to_hash(hash_hex, &entry->hash) != 0) {
+            fprintf(stderr, "error: invalid hash in index file\n");
+            fclose(f);
+            return -1;
+        }
+        index->count++;
+    }
+
+    fclose(f);
+    return 0;
 }
 
 // Save the index to .pes/index atomically.
@@ -152,10 +186,51 @@ int index_load(Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_save(const Index *index) {
-    // TODO: Implement atomic index saving
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    char *tmp_path = ".pes/index.tmp";
+    FILE *f = fopen(tmp_path, "w");
+    if (!f) {
+        perror("fopen");
+        return -1;
+    }
+
+    Index temp_index = *index;
+    qsort(temp_index.entries, temp_index.count, sizeof(IndexEntry), compare_index_entries);
+
+    for (int i = 0; i < temp_index.count; i++) {
+        const IndexEntry *entry = &temp_index.entries[i];
+        char hash_hex[HASH_HEX_SIZE];
+        hash_to_hex(&entry->hash, hash_hex);
+        if (fprintf(f, "%o %s %lu %u %s\n",
+                    entry->mode, hash_hex, entry->mtime_sec,
+                    entry->size, entry->path) < 0) {
+            perror("fprintf");
+            fclose(f);
+            return -1;
+        }
+    }
+
+    if (fflush(f) != 0) {
+        perror("fflush");
+        fclose(f);
+        return -1;
+    }
+    int fd = fileno(f);
+    if (fsync(fd) != 0) {
+        perror("fsync");
+        fclose(f);
+        return -1;
+    }
+    if (fclose(f) != 0) {
+        perror("fclose");
+        return -1;
+    }
+
+    if (rename(tmp_path, ".pes/index") != 0) {
+        perror("rename");
+        return -1;
+    }
+
+    return 0;
 }
 
 // Stage a file for the next commit.
@@ -168,8 +243,62 @@ int index_save(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_add(Index *index, const char *path) {
-    // TODO: Implement file staging
-    // (See Lab Appendix for logical steps)
-    (void)index; (void)path;
-    return -1;
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        perror("lstat");
+        return -1;
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        perror("fopen");
+        return -1;
+    }
+
+    void *buffer = malloc(st.st_size);
+    if (!buffer) {
+        perror("malloc");
+        fclose(f);
+        return -1;
+    }
+
+    if (fread(buffer, 1, st.st_size, f) != (size_t)st.st_size) {
+        perror("fread");
+        free(buffer);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    ObjectID hash;
+    if (object_write(OBJ_BLOB, buffer, st.st_size, &hash) != 0) {
+        fprintf(stderr, "error: failed to write blob object\n");
+        free(buffer);
+        return -1;
+    }
+    free(buffer);
+
+    IndexEntry *entry = index_find(index, path);
+    if (entry) {
+        // Update existing entry
+        entry->hash = hash;
+        entry->mode = st.st_mode;
+        entry->size = st.st_size;
+        entry->mtime_sec = st.st_mtime;
+    } else {
+        // Add new entry
+        if (index->count >= MAX_INDEX_ENTRIES) {
+            fprintf(stderr, "error: index is full\n");
+            return -1;
+        }
+        entry = &index->entries[index->count];
+        strcpy(entry->path, path);
+        entry->hash = hash;
+        entry->mode = st.st_mode;
+        entry->size = st.st_size;
+        entry->mtime_sec = st.st_mtime;
+        index->count++;
+    }
+
+    return index_save(index);
 }

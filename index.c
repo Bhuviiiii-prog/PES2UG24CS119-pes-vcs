@@ -24,6 +24,10 @@
 #include <unistd.h>
 #include <dirent.h>
 
+// Forward declarations (implemented in object.c)
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out);
+
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
 // Find an index entry by path (linear scan).
@@ -127,13 +131,6 @@ int index_status(const Index *index) {
 
 // ─── TODO: Implement these ───────────────────────────────────────────────────
 
-// Comparison function for qsort to sort index entries by path
-static int compare_index_entries(const void *a, const void *b) {
-    const IndexEntry *entry_a = (const IndexEntry *)a;
-    const IndexEntry *entry_b = (const IndexEntry *)b;
-    return strcmp(entry_a->path, entry_b->path);
-}
-
 // Load the index from .pes/index.
 //
 // HINTS - Useful functions:
@@ -143,37 +140,36 @@ static int compare_index_entries(const void *a, const void *b) {
 // Returns 0 on success, -1 on error.
 int index_load(Index *index) {
     index->count = 0;
-    FILE *f = fopen(".pes/index", "r");
-    if (!f) {
-        // If .pes/index doesn't exist, it's not an error, just an empty index.
-        return 0;
-    }
+    FILE *f = fopen(INDEX_FILE, "r");
+    if (!f) return 0; // No index yet; empty is fine
 
-    while (index->count < MAX_INDEX_ENTRIES) {
-        IndexEntry *entry = &index->entries[index->count];
-        char hash_hex[HASH_HEX_SIZE];
-        int items = fscanf(f, "%o %64s %lu %u %511s\n",
-                           &entry->mode, hash_hex, &entry->mtime_sec,
-                           &entry->size, entry->path);
-        if (items == EOF) {
-            break;
-        }
-        if (items != 5) {
-            fprintf(stderr, "error: invalid index file format\n");
-            fclose(f);
-            return -1;
-        }
-        if (hex_to_hash(hash_hex, &entry->hash) != 0) {
-            fprintf(stderr, "error: invalid hash in index file\n");
-            fclose(f);
-            return -1;
-        }
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        if (index->count >= MAX_INDEX_ENTRIES) break;
+        // Trim newline
+        line[strcspn(line, "\r\n")] = '\0';
+
+        IndexEntry *e = &index->entries[index->count];
+        char hex[HASH_HEX_SIZE + 1];
+        unsigned long long mtime_ll = 0;
+        unsigned int mode_octal = 0;
+        unsigned int size_u = 0;
+        // Parse: <mode-octal> <64-char-hex-hash> <mtime-seconds> <size> <path>
+        // Path may contain spaces so use %511[^\n]
+        int rc = sscanf(line, "%o %64s %llu %u %511[^\n]",&mode_octal, hex, &mtime_ll, &size_u, e->path);
+        if (rc < 5) continue; // skip malformed lines
+
+        e->mode = (uint32_t)mode_octal;
+        e->mtime_sec = (uint64_t)mtime_ll;
+        e->size = (uint32_t)size_u;
+        if (hex_to_hash(hex, &e->hash) != 0) continue;
+
         index->count++;
     }
 
     fclose(f);
     return 0;
-}
+    }
 
 // Save the index to .pes/index atomically.
 //
@@ -185,51 +181,40 @@ int index_load(Index *index) {
 //   - rename                           : atomically moving the temp file over the old index
 //
 // Returns 0 on success, -1 on error.
+int cmp_index_entries(const void *a, const void *b) {
+    const IndexEntry *ea = (const IndexEntry *)a;
+    const IndexEntry *eb = (const IndexEntry *)b;
+    return strcmp(ea->path, eb->path);
+    }
 int index_save(const Index *index) {
-    char *tmp_path = ".pes/index.tmp";
+    // Ensure .pes directory exists
+    mkdir(PES_DIR, 0755);
+
+    // Make a sorted copy
+    Index tmp = *index;
+    // qsort by path
+    qsort(tmp.entries, tmp.count, sizeof(IndexEntry), cmp_index_entries);
+
+    char tmp_path[512];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", INDEX_FILE, getpid());
     FILE *f = fopen(tmp_path, "w");
-    if (!f) {
-        perror("fopen");
-        return -1;
+    if (!f) return -1;
+
+    for (int i = 0; i < tmp.count; i++) {
+        const IndexEntry *e = &tmp.entries[i];
+        char hex[HASH_HEX_SIZE + 1];
+        hash_to_hex(&e->hash, hex);
+        fprintf(f, "%o %s %llu %u %s\n", e->mode, hex, (unsigned long long)e->mtime_sec, e->size, e->path);
     }
 
-    Index temp_index = *index;
-    qsort(temp_index.entries, temp_index.count, sizeof(IndexEntry), compare_index_entries);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
 
-    for (int i = 0; i < temp_index.count; i++) {
-        const IndexEntry *entry = &temp_index.entries[i];
-        char hash_hex[HASH_HEX_SIZE];
-        hash_to_hex(&entry->hash, hash_hex);
-        if (fprintf(f, "%o %s %lu %u %s\n",
-                    entry->mode, hash_hex, entry->mtime_sec,
-                    entry->size, entry->path) < 0) {
-            perror("fprintf");
-            fclose(f);
-            return -1;
-        }
-    }
+    if (rename(tmp_path, INDEX_FILE) != 0) { unlink(tmp_path); return -1; }
 
-    if (fflush(f) != 0) {
-        perror("fflush");
-        fclose(f);
-        return -1;
-    }
-    int fd = fileno(f);
-    if (fsync(fd) != 0) {
-        perror("fsync");
-        fclose(f);
-        return -1;
-    }
-    if (fclose(f) != 0) {
-        perror("fclose");
-        return -1;
-    }
-
-    if (rename(tmp_path, ".pes/index") != 0) {
-        perror("rename");
-        return -1;
-    }
-
+    int dirfd = open(PES_DIR, O_RDONLY | O_DIRECTORY);
+    if (dirfd >= 0) { fsync(dirfd); close(dirfd); }
     return 0;
 }
 
@@ -244,61 +229,44 @@ int index_save(const Index *index) {
 // Returns 0 on success, -1 on error.
 int index_add(Index *index, const char *path) {
     struct stat st;
-    if (lstat(path, &st) != 0) {
-        perror("lstat");
+    if (stat(path, &st) != 0) {
+        fprintf(stderr, "error: cannot stat '%s'\n", path);
+        return -1;
+    }
+
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "error: '%s' is not a regular file\n", path);
         return -1;
     }
 
     FILE *f = fopen(path, "rb");
-    if (!f) {
-        perror("fopen");
-        return -1;
-    }
-
-    void *buffer = malloc(st.st_size);
-    if (!buffer) {
-        perror("malloc");
-        fclose(f);
-        return -1;
-    }
-
-    if (fread(buffer, 1, st.st_size, f) != (size_t)st.st_size) {
-        perror("fread");
-        free(buffer);
-        fclose(f);
-        return -1;
-    }
+    if (!f) { fprintf(stderr, "error: cannot open '%s'\n", path); return -1; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    rewind(f);
+    uint8_t *buf = malloc(sz > 0 ? (size_t)sz : 1);
+    if (!buf) { fclose(f); return -1; }
+    if (sz > 0) fread(buf, 1, (size_t)sz, f);
     fclose(f);
 
-    ObjectID hash;
-    if (object_write(OBJ_BLOB, buffer, st.st_size, &hash) != 0) {
-        fprintf(stderr, "error: failed to write blob object\n");
-        free(buffer);
-        return -1;
-    }
-    free(buffer);
+    ObjectID id;
+    if (object_write(OBJ_BLOB, buf, (size_t)sz, &id) != 0) { free(buf); return -1; }
+    free(buf);
 
-    IndexEntry *entry = index_find(index, path);
-    if (entry) {
-        // Update existing entry
-        entry->hash = hash;
-        entry->mode = st.st_mode;
-        entry->size = st.st_size;
-        entry->mtime_sec = st.st_mtime;
-    } else {
-        // Add new entry
-        if (index->count >= MAX_INDEX_ENTRIES) {
-            fprintf(stderr, "error: index is full\n");
-            return -1;
-        }
-        entry = &index->entries[index->count];
-        strcpy(entry->path, path);
-        entry->hash = hash;
-        entry->mode = st.st_mode;
-        entry->size = st.st_size;
-        entry->mtime_sec = st.st_mtime;
-        index->count++;
+    IndexEntry *e = index_find(index, path);
+    if (!e) {
+        if (index->count >= MAX_INDEX_ENTRIES) return -1;
+        e = &index->entries[index->count++];
+        strncpy(e->path, path, sizeof(e->path));
+        e->path[sizeof(e->path)-1] = '\0';
     }
+
+    // Fill metadata
+    e->hash = id;
+    e->mtime_sec = (uint64_t)st.st_mtime;
+    e->size = (uint32_t)st.st_size;
+    // Simple mode mapping
+    if (st.st_mode & S_IXUSR) e->mode = 0100755; else e->mode = 0100644;
 
     return index_save(index);
 }
